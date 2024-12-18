@@ -1,0 +1,110 @@
+CREATE OR REPLACE TABLE CLUSTER_DEPTH_MONITORING (
+    DATABASE_NAME VARCHAR,
+    SCHENA_NAME VARCHAR,
+    TABLE_NAME VARCHAR,
+    CLUSTERING_DEPTH FLOAT,
+    INSERTED_AT TIMESTAMP,
+    INSERTED_BY VARCHAR
+);
+
+
+-- CM_IDENTIFY_TABLES: クラスタ化されたテーブルを特定するタスク
+CREATE OR REPLACE TASK CM_IDENTIFY_TABLES
+AS 
+BEGIN
+    ALTER SESSION SET QUERY_TAG='cluster_depth_monitoring';
+    SHOW TABLES IN DATABASE SNOWFLAKE_SAMPLE_DATA;
+    CREATE OR REPLACE TRANSIENT TABLE CLUSTERED_TABLE_INFO AS
+    SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) WHERE "cluster_by" != '';
+END;
+
+CREATE OR REPLACE PROCEDURE CM_INSERT_DETAILS()
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'main'
+EXECUTE AS CALLER
+AS
+$$
+from snowflake import snowpark
+from snowflake.snowpark.functions import col, lit, udf, call_builtin, concat_ws, current_timestamp
+from snowflake.snowpark.types import IntegerType, StringType, StructField, StructType, FloatType
+
+def get_clustering_depth(session, table_name: str) -> int:
+    query = f"SELECT SYSTEM$CLUSTERING_DEPTH('{table_name}') AS depth"
+    result = session.sql(query).collect()
+    return result[0][0]
+
+def main(session: snowpark.Session): 
+    session.query_tag = 'cluster_depth_monitoring'
+
+    # PUBLIC.CLUSTERED_TABLE_INFOテーブルからデータを取得
+    tableName = 'PUBLIC.CLUSTERED_TABLE_INFO'
+    df = session.table(tableName)
+    
+    # pandas DataFrameに変換
+    df_pd = df.to_pandas()
+    
+    # クラスタリング深度のリストを作成
+    depth_list = []
+    for index, row in df_pd.iterrows():
+        # 完全修飾テーブル名を作成
+        table_name = f'{row["database_name"]}.{row["schema_name"]}.{row["name"]}'
+        depth = get_clustering_depth(session, table_name)
+        depth_list.append([depth, table_name])
+    
+    # スキーマを定義
+    schema = StructType([
+        StructField("clustering_depth", FloatType()), 
+        StructField("table_name", StringType())
+    ])
+    
+    # クラスタリング深度のDataFrameを作成
+    clustering_depth_df = session.create_dataframe(depth_list, schema)
+
+    
+    # 元のDataFrameとクラスタリング深度のDataFrameを結合
+    result_df = df.join(clustering_depth_df, 
+                        concat_ws(lit('.'), df.col('"database_name"'), df.col('"schema_name"'), df.col('"name"')) == clustering_depth_df.col("table_name"))
+
+    
+    # 必要な列を選択
+    result_df = result_df.select(
+        col('"database_name"').alias("DATABASE_NAME"),
+        col('"schema_name"').alias("SCHEMA_NAME"),
+        col('"name"').alias("TABLE_NAME"),
+        col("CLUSTERING_DEPTH"),
+        current_timestamp().alias("INSERTED_AT"),
+        call_builtin('system$current_user_task_name').alias("INSERTED_BY")
+    ).write.save_as_table("cluster_depth_monitoring", mode="append")
+    
+    return "OK"
+$$;
+
+-- CM_INSERT_DETAILS: クラスタ化されたテーブルのクラスタリング深度を記録するタスク
+CREATE OR REPLACE TASK CM_INSERT_DETAILS
+    AFTER CM_IDENTIFY_TABLES
+AS CALL CM_INSERT_DETAILS();
+
+-- CM_CLEAN_UP: 一時テーブルをクリーンアップするタスク
+CREATE OR REPLACE TASK CM_CLEAN_UP
+    AFTER CM_INSERT_DETAILS
+AS 
+BEGIN
+    ALTER SESSION SET QUERY_TAG='cluster_depth_monitoring';
+    DROP TABLE IF EXISTS CLUSTERED_TABLE_INFO;
+END;
+
+ALTER TASK CM_CLEAN_UP RESUME;
+ALTER TASK CM_INSERT_DETAILS RESUME;
+
+EXECUTE TASK CM_IDENTIFY_TABLES;
+
+-- タスクの実行状況を確認
+SELECT * FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY())
+WHERE NAME IN ('CM_IDENTIFY_TABLES', 'CM_INSERT_DETAILS', 'CM_CLEAN_UP')
+ORDER BY SCHEDULED_TIME DESC;
+
+
+SELECT * FROM CLUSTER_DEPTH_MONITORING;
